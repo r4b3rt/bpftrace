@@ -8,9 +8,9 @@ using ::testing::NiceMock;
 using ::testing::Return;
 using ::testing::StrictMock;
 
-void setup_mock_bpftrace(MockBPFtrace &bpftrace)
+void setup_mock_probe_matcher(MockProbeMatcher &matcher)
 {
-  ON_CALL(bpftrace,
+  ON_CALL(matcher,
           get_symbols_from_file(
               "/sys/kernel/debug/tracing/available_filter_functions"))
       .WillByDefault([](const std::string &) {
@@ -24,7 +24,7 @@ void setup_mock_bpftrace(MockBPFtrace &bpftrace)
         return myval;
       });
 
-  ON_CALL(bpftrace,
+  ON_CALL(matcher,
           get_symbols_from_file("/sys/kernel/debug/tracing/available_events"))
       .WillByDefault([](const std::string &) {
         std::string tracepoints = "sched:sched_one\n"
@@ -32,7 +32,8 @@ void setup_mock_bpftrace(MockBPFtrace &bpftrace)
                                   "sched:foo\n"
                                   "sched_extra:sched_extra\n"
                                   "notsched:bar\n"
-                                  "file:filename\n";
+                                  "file:filename\n"
+                                  "tcp:some_tcp_tp\n";
         return std::unique_ptr<std::istream>(new std::istringstream(tracepoints));
       });
 
@@ -43,83 +44,88 @@ void setup_mock_bpftrace(MockBPFtrace &bpftrace)
                          "/bin/sh:_Z11cpp_mangledi\n"
                          "/bin/sh:_Z11cpp_mangledv\n";
   std::string bash_usyms = "/bin/bash:first_open\n";
-  ON_CALL(bpftrace, extract_func_symbols_from_path("/bin/sh"))
-      .WillByDefault(Return(sh_usyms));
-  ON_CALL(bpftrace, extract_func_symbols_from_path("/bin/*sh"))
-      .WillByDefault(Return(sh_usyms + bash_usyms));
-
-  ON_CALL(bpftrace, get_symbols_from_usdt(_, _))
-      .WillByDefault([](int, const std::string &) {
-        std::string usdt_syms = "/bin/sh:prov1:tp1\n"
-                                "/bin/sh:prov1:tp2\n"
-                                "/bin/sh:prov2:tp\n"
-                                "/bin/sh:prov2:notatp\n"
-                                "/bin/sh:nahprov:tp\n"
-                                "/bin/bash:prov1:tp3";
-        return std::unique_ptr<std::istream>(new std::istringstream(usdt_syms));
+  ON_CALL(matcher, get_func_symbols_from_file("/bin/sh"))
+      .WillByDefault([sh_usyms](const std::string &) {
+        return std::unique_ptr<std::istream>(new std::istringstream(sh_usyms));
       });
 
+  ON_CALL(matcher, get_func_symbols_from_file("/bin/*sh"))
+      .WillByDefault([sh_usyms, bash_usyms](const std::string &) {
+        return std::unique_ptr<std::istream>(
+            new std::istringstream(sh_usyms + bash_usyms));
+      });
+
+  std::string sh_usdts = "/bin/sh:prov1:tp1\n"
+                         "/bin/sh:prov1:tp2\n"
+                         "/bin/sh:prov2:tp\n"
+                         "/bin/sh:prov2:notatp\n"
+                         "/bin/sh:nahprov:tp\n";
+  std::string bash_usdts = "/bin/bash:prov1:tp3";
+  ON_CALL(matcher, get_symbols_from_usdt(_, "/bin/sh"))
+      .WillByDefault([sh_usdts](int, const std::string &) {
+        return std::unique_ptr<std::istream>(new std::istringstream(sh_usdts));
+      });
+  ON_CALL(matcher, get_symbols_from_usdt(_, "/bin/*sh"))
+      .WillByDefault([sh_usdts, bash_usdts](int, const std::string &) {
+        return std::unique_ptr<std::istream>(
+            new std::istringstream(sh_usdts + bash_usdts));
+      });
+}
+
+void setup_mock_bpftrace(MockBPFtrace &bpftrace)
+{
   // Fill in some default tracepoint struct definitions
-  bpftrace.structs_["struct _tracepoint_sched_sched_one"] = Struct{
-    .size = 8,
-    .fields = { { "common_field",
-                  Field{
-                      .type = CreateUInt64(),
-                      .offset = 8,
-                      .is_bitfield = false,
-                      .bitfield = {},
-                  } } },
-  };
-  bpftrace.structs_["struct _tracepoint_sched_sched_two"] = Struct{
-    .size = 8,
-    .fields = { { "common_field",
-                  Field{
-                      .type = CreateUInt64(),
-                      .offset = 16, // different offset than
-                                    // sched_one.common_field
-                      .is_bitfield = false,
-                      .bitfield = {},
-                  } } },
-  };
-  bpftrace.structs_["struct _tracepoint_sched_extra_sched_extra"] = Struct{
-    .size = 8,
-    .fields = { { "common_field",
-                  Field{
-                      .type = CreateUInt64(),
-                      .offset = 24, // different offset than
-                                    // sched_(one|two).common_field
-                      .is_bitfield = false,
-                      .bitfield = {},
-                  } } },
-  };
-  bpftrace.structs_["struct _tracepoint_tcp_some_tcp_tp"] = Struct{
-    .size = 16,
-    .fields = { { "saddr_v6",
-                  Field{
-                      .type = CreateArray(16, CreateUInt(8)),
-                      .offset = 0,
-                      .is_bitfield = false,
-                      .bitfield = {},
-                  } } },
-  };
+  bpftrace.structs.Add("struct _tracepoint_sched_sched_one", 8);
+  bpftrace.structs.Lookup("struct _tracepoint_sched_sched_one")
+      .lock()
+      ->AddField("common_field", CreateUInt64(), 8, false, {}, false);
+
+  bpftrace.structs.Add("struct _tracepoint_sched_sched_two", 8);
+  bpftrace.structs.Lookup("struct _tracepoint_sched_sched_two")
+      .lock()
+      ->AddField("common_field",
+                 CreateUInt64(),
+                 16, // different offset than
+                     // sched_one.common_field
+                 false,
+                 {},
+                 false);
+  bpftrace.structs.Add("struct _tracepoint_sched_extra_sched_extra", 8);
+  bpftrace.structs.Lookup("struct _tracepoint_sched_extra_sched_extra")
+      .lock()
+      ->AddField("common_field",
+                 CreateUInt64(),
+                 24, // different offset than
+                     // sched_(one|two).common_field
+                 false,
+                 {},
+                 false);
+  bpftrace.structs.Add("struct _tracepoint_tcp_some_tcp_tp", 16);
+  bpftrace.structs.Lookup("struct _tracepoint_tcp_some_tcp_tp")
+      .lock()
+      ->AddField(
+          "saddr_v6", CreateArray(16, CreateUInt(8)), 8, false, {}, false);
 
   auto ptr_type = CreatePointer(CreateInt8());
-  bpftrace.structs_["struct _tracepoint_file_filename"] = Struct{
-    .size = 8,
-    .fields = { { "filename",
-                  Field{
-                      .type = ptr_type,
-                      .offset = 8,
-                      .is_bitfield = false,
-                      .bitfield = {},
-                  } } },
-  };
+  bpftrace.structs.Add("struct _tracepoint_file_filename", 8);
+  bpftrace.structs.Lookup("struct _tracepoint_file_filename")
+      .lock()
+      ->AddField("common_field", CreateUInt64(), 0, false, {}, false);
+  bpftrace.structs.Lookup("struct _tracepoint_file_filename")
+      .lock()
+      ->AddField("filename", ptr_type, 8, false, {}, false);
 }
 
 std::unique_ptr<MockBPFtrace> get_mock_bpftrace()
 {
   auto bpftrace = std::make_unique<NiceMock<MockBPFtrace>>();
   setup_mock_bpftrace(*bpftrace);
+
+  auto probe_matcher = std::make_unique<NiceMock<MockProbeMatcher>>(
+      bpftrace.get());
+  setup_mock_probe_matcher(*probe_matcher);
+  bpftrace->set_mock_probe_matcher(std::move(probe_matcher));
+
   return bpftrace;
 }
 
@@ -127,6 +133,12 @@ std::unique_ptr<MockBPFtrace> get_strict_mock_bpftrace()
 {
   auto bpftrace = std::make_unique<StrictMock<MockBPFtrace>>();
   setup_mock_bpftrace(*bpftrace);
+
+  auto probe_matcher = std::make_unique<StrictMock<MockProbeMatcher>>(
+      bpftrace.get());
+  setup_mock_probe_matcher(*probe_matcher);
+  bpftrace->set_mock_probe_matcher(std::move(probe_matcher));
+
   return bpftrace;
 }
 

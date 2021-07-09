@@ -1,6 +1,6 @@
 struct T {
   uint32_t a;
-  uint32_t b;
+  uint32_t b[2];
 };
 
 struct W {
@@ -24,16 +24,16 @@ uprobe:./testprogs/struct_array:clear {
   printf("%d ", $c->w[8].a);
 
   printf("-- ");
-  printf("%d ", $c->w[0].t.a);
-  printf("%d ", $c->w[2].t.a);
-  printf("%d ", $c->w[4].t.a);
-  printf("%d ", $c->w[6].t.a);
-  printf("%d ", $c->w[8].t.a);
+  printf("%d ", $c->w[1].t.a);
+  printf("%d ", $c->w[3].t.a);
+  printf("%d ", $c->w[5].t.a);
+  printf("%d ", $c->w[7].t.a);
+  printf("%d ", $c->w[9].t.a);
 
   printf("-- ");
-  printf("%d ", $c->w[0].t.b);
-  printf("%d ", $c->w[2].t.b);
-  printf("%d ", $c->w[4].t.b);
-  printf("%d ", $c->w[6].t.b);
-  printf("%d\n", $c->w[8].t.b);
+  printf("%d ", $c->w[0].t.b[1]);
+  printf("%d ", $c->w[1].t.b[1]);
+  printf("%d ", $c->w[2].t.b[1]);
+  printf("%d ", $c->w[3].t.b[1]);
+  printf("%d\n", $c->w[4].t.b[1]);
 }

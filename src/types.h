@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cassert>
+#include <map>
 #include <memory>
 #include <ostream>
 #include <sstream>
@@ -8,6 +9,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <vector>
+
+#include <cereal/access.hpp>
 
 namespace bpftrace {
 
@@ -36,7 +39,6 @@ enum class Type
   string,
   ksym,
   usym,
-  join,
   probe,
   username,
   inet,
@@ -44,7 +46,8 @@ enum class Type
   array,
   buffer,
   tuple,
-  timestamp
+  timestamp,
+  mac_address
   // clang-format on
 };
 
@@ -72,25 +75,35 @@ struct StackType
   bool operator ==(const StackType &obj) const {
     return limit == obj.limit && mode == obj.mode;
   }
+
+private:
+  friend class cereal::access;
+  template <typename Archive>
+  void serialize(Archive &archive)
+  {
+    archive(limit, mode);
+  }
 };
 
-struct Tuple;
+class BPFtrace;
+struct Struct;
 struct Field;
 
 class SizedType
 {
 public:
-  SizedType() : type(Type::none), size(0) { }
-  SizedType(Type type, size_t size_, bool is_signed)
-      : type(type), size(size_), is_signed_(is_signed)
+  SizedType() : type(Type::none), size_(0)
   {
   }
-  SizedType(Type type, size_t size_) : type(type), size(size_)
+  SizedType(Type type, size_t size_, bool is_signed)
+      : type(type), size_(size_), is_signed_(is_signed)
+  {
+  }
+  SizedType(Type type, size_t size_) : type(type), size_(size_)
   {
   }
 
   Type type;
-  size_t size;                 // in bytes
   StackType stack_type;
   bool is_internal = false;
   bool is_tparg = false;
@@ -98,24 +111,51 @@ public:
   int kfarg_idx = -1;
 
 private:
+  size_t size_ = -1; // in bytes
   bool is_signed_ = false;
-  SizedType *element_type_ = nullptr; // for "container" and pointer
-                                      // (like) types
-  size_t num_elements_;               // for array like types
+  std::shared_ptr<SizedType> element_type_; // for "container" and pointer
+                                            // (like) types
+  size_t num_elements_ = -1;                // for array like types
   std::string name_; // name of this type, for named types like struct
   bool ctx_ = false; // Is bpf program context
   AddrSpace as_ = AddrSpace::none;
-  ssize_t size_bits; // size in bits for integer types
+  ssize_t size_bits_ = -1; // size in bits for integer types
 
-  std::shared_ptr<Tuple> tuple_fields; // tuple fields
+  std::weak_ptr<Struct> inner_struct_; // inner struct for records and tuples
+                                       // the actual Struct object is owned by
+                                       // StructManager
+
+  friend class cereal::access;
+  template <typename Archive>
+  void serialize(Archive &archive)
+  {
+    archive(type,
+            stack_type,
+            is_internal,
+            is_tparg,
+            is_kfarg,
+            kfarg_idx,
+            size_,
+            is_signed_,
+            element_type_,
+            num_elements_,
+            name_,
+            ctx_,
+            as_,
+            size_bits_,
+            inner_struct_);
+  }
 
 public:
   /**
-     Tuple accessors
+     Tuple/struct accessors
   */
   std::vector<Field> &GetFields() const;
+  bool HasField(const std::string &name) const;
+  const Field &GetField(const std::string &name) const;
   Field &GetField(ssize_t n) const;
   ssize_t GetFieldCount() const;
+  std::weak_ptr<const Struct> GetStruct() const;
 
   /**
      Required alignment for this type
@@ -147,7 +187,7 @@ public:
     ctx_ = true;
   };
 
-  bool IsArray() const;
+  bool IsByteArray() const;
   bool IsAggregate() const;
   bool IsStack() const;
 
@@ -158,23 +198,38 @@ public:
 
   bool IsPrintableTy()
   {
-    return type != Type::none && type != Type::record &&
-           type != Type::pointer && type != Type::stack_mode &&
-           type != Type::array && type != Type::record && !IsCtxAccess();
+    return type != Type::none && type != Type::pointer &&
+           type != Type::stack_mode && !IsCtxAccess();
   }
 
   bool IsSigned(void) const;
 
+  size_t GetSize() const
+  {
+    return size_;
+  }
+
+  void SetSize(size_t size)
+  {
+    size_ = size;
+    if (IsIntTy())
+    {
+      assert(size == 0 || size == 1 || size == 8 || size == 16 || size == 32 ||
+             size == 64);
+      size_bits_ = size * 8;
+    }
+  }
+
   size_t GetIntBitWidth() const
   {
     assert(IsIntTy());
-    return size_bits;
+    return size_bits_;
   };
 
   size_t GetNumElements() const
   {
     assert(IsArrayTy() || IsStringTy());
-    return size;
+    return IsStringTy() ? size_ : size_ / element_type_->size_;
   };
 
   const std::string GetName() const
@@ -186,18 +241,18 @@ public:
   const SizedType *GetElementTy() const
   {
     assert(IsArrayTy());
-    return element_type_;
+    return element_type_.get();
   }
 
   const SizedType *GetPointeeTy() const
   {
     assert(IsPtrTy());
-    return element_type_;
+    return element_type_.get();
   }
 
   bool IsBoolTy() const
   {
-    return type == Type::integer && size_bits == 1;
+    return type == Type::integer && size_bits_ == 1;
   };
   bool IsPtrTy() const
   {
@@ -267,11 +322,6 @@ public:
   {
     return type == Type::usym;
   };
-
-  bool IsJoinTy(void) const
-  {
-    return type == Type::join;
-  };
   bool IsProbeTy(void) const
   {
     return type == Type::probe;
@@ -308,6 +358,10 @@ public:
   {
     return type == Type::timestamp;
   };
+  bool IsMacAddressTy(void) const
+  {
+    return type == Type::mac_address;
+  };
 
   friend std::ostream &operator<<(std::ostream &, const SizedType &);
   friend std::ostream &operator<<(std::ostream &, Type);
@@ -318,9 +372,10 @@ public:
                                const SizedType &element_type);
 
   friend SizedType CreatePointer(const SizedType &pointee_type, AddrSpace as);
-  friend SizedType CreateRecord(size_t size, const std::string &name);
+  friend SizedType CreateRecord(const std::string &name,
+                                std::weak_ptr<Struct> record);
   friend SizedType CreateInteger(size_t bits, bool is_signed);
-  friend SizedType CreateTuple(const std::vector<SizedType> &fields);
+  friend SizedType CreateTuple(std::weak_ptr<Struct> tuple);
 };
 // Type helpers
 
@@ -342,12 +397,9 @@ SizedType CreateString(size_t size);
 SizedType CreateArray(size_t num_elements, const SizedType &element_type);
 SizedType CreatePointer(const SizedType &pointee_type,
                         AddrSpace as = AddrSpace::none);
-/**
-   size in bytes
- */
-SizedType CreateRecord(size_t size, const std::string &name);
 
-SizedType CreateTuple(const std::vector<SizedType> &fields);
+SizedType CreateRecord(const std::string &name, std::weak_ptr<Struct> record);
+SizedType CreateTuple(std::weak_ptr<Struct> tuple);
 
 SizedType CreateStackMode();
 SizedType CreateStack(bool kernel, StackType st = StackType());
@@ -365,9 +417,9 @@ SizedType CreateLhist();
 SizedType CreateHist();
 SizedType CreateUSym();
 SizedType CreateKSym();
-SizedType CreateJoin(size_t argnum, size_t argsize);
 SizedType CreateBuffer(size_t size);
 SizedType CreateTimestamp();
+SizedType CreateMacAddress();
 
 std::ostream &operator<<(std::ostream &os, const SizedType &type);
 
@@ -385,8 +437,10 @@ enum class ProbeType
   software,
   hardware,
   watchpoint,
+  asyncwatchpoint,
   kfunc,
   kretfunc,
+  iter,
 };
 
 std::ostream &operator<<(std::ostream &os, ProbeType type);
@@ -398,8 +452,7 @@ struct ProbeItem
   ProbeType type;
 };
 
-const std::vector<ProbeItem> PROBE_LIST =
-{
+const std::vector<ProbeItem> PROBE_LIST = {
   { "kprobe", "k", ProbeType::kprobe },
   { "kretprobe", "kr", ProbeType::kretprobe },
   { "uprobe", "u", ProbeType::uprobe },
@@ -413,11 +466,14 @@ const std::vector<ProbeItem> PROBE_LIST =
   { "software", "s", ProbeType::software },
   { "hardware", "h", ProbeType::hardware },
   { "watchpoint", "w", ProbeType::watchpoint },
+  { "asyncwatchpoint", "aw", ProbeType::asyncwatchpoint },
   { "kfunc", "f", ProbeType::kfunc },
   { "kretfunc", "fr", ProbeType::kretfunc },
+  { "iter", "it", ProbeType::iter },
 };
 
 ProbeType probetype(const std::string &type);
+bool is_userspace_probe(const ProbeType &probe_type);
 std::string addrspacestr(AddrSpace as);
 std::string typestr(Type t);
 std::string probetypeName(const std::string &type);
@@ -431,15 +487,17 @@ struct Probe
   std::string orig_name;        // original full probe name,
                                 // before wildcard expansion
   std::string name;             // full probe name
+  std::string pin;              // pin file for iterator probes
   std::string ns;               // for USDT probes, if provider namespace not from path
-  uint64_t loc;                 // for USDT probes
+  uint64_t loc = 0;             // for USDT probes
   int usdt_location_idx = 0;    // to disambiguate duplicate USDT markers
-  uint64_t log_size;
+  uint64_t log_size = 1000000;
   int index = 0;
-  int freq;
+  int freq = 0;
   pid_t pid = -1;
   uint64_t len = 0;             // for watchpoint probes, size of region
   std::string mode;             // for watchpoint probes, watch mode (rwx)
+  bool async = false; // for watchpoint probes, if it's an async watchpoint
   uint64_t address = 0;
   uint64_t func_offset = 0;
 };
@@ -460,7 +518,9 @@ enum class AsyncAction
   join,
   helper_error,
   print_non_map,
-  strftime
+  strftime,
+  watchpoint_attach,
+  watchpoint_detach,
   // clang-format on
 };
 
@@ -474,6 +534,8 @@ enum class PositionalParameterType
 
 } // namespace bpftrace
 
+// SizedType hash function
+// Allows to use SizedType in unordered_set/map.
 namespace std {
 template <>
 struct hash<bpftrace::StackType>
@@ -490,6 +552,12 @@ struct hash<bpftrace::StackType>
 
     return {}; // unreached
   }
+};
+
+template <>
+struct hash<bpftrace::SizedType>
+{
+  size_t operator()(const bpftrace::SizedType &type) const;
 };
 
 } // namespace std

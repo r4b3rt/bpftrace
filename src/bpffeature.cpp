@@ -7,10 +7,11 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <fstream>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "btf.h"
-#include "list.h"
+#include "probe_matcher.h"
 #include "utils.h"
 
 namespace bpftrace {
@@ -66,14 +67,15 @@ static bool try_load(const char* name,
 
 static bool try_load(enum libbpf::bpf_prog_type prog_type,
                      struct bpf_insn* insns,
-                     size_t len)
+                     size_t len,
+                     const char* name = nullptr)
 {
   constexpr int log_size = 4096;
   char logbuf[log_size] = {};
 
   // kfunc / kretfunc only for now. We can refactor if more attach types
   // get added to BPF_PROG_TYPE_TRACING
-  if (prog_type == libbpf::BPF_PROG_TYPE_TRACING)
+  if (prog_type == libbpf::BPF_PROG_TYPE_TRACING && !name)
   {
     // List of available functions must be readable
     std::ifstream traceable_funcs(kprobe_path);
@@ -82,13 +84,23 @@ static bool try_load(enum libbpf::bpf_prog_type prog_type,
     // because it still means kfunc doesn't work, only from a library side, not
     // a kernel side.
     return traceable_funcs.good() &&
-           try_load(
-               "kfunc__strlen", prog_type, insns, len, 0, logbuf, log_size) &&
-           try_load(
-               "kretfunc__strlen", prog_type, insns, len, 0, logbuf, log_size);
+           try_load("kfunc__sched_fork",
+                    prog_type,
+                    insns,
+                    len,
+                    0,
+                    logbuf,
+                    log_size) &&
+           try_load("kretfunc__sched_fork",
+                    prog_type,
+                    insns,
+                    len,
+                    0,
+                    logbuf,
+                    log_size);
   }
 
-  return try_load(nullptr, prog_type, insns, len, 0, logbuf, log_size);
+  return try_load(name, prog_type, insns, len, 0, logbuf, log_size);
 }
 
 bool BPFfeature::detect_helper(enum libbpf::bpf_func_id func_id,
@@ -122,10 +134,11 @@ bool BPFfeature::detect_helper(enum libbpf::bpf_func_id func_id,
          (strstr(buf, "unknown func ") == nullptr);
 }
 
-bool BPFfeature::detect_prog_type(enum libbpf::bpf_prog_type prog_type)
+bool BPFfeature::detect_prog_type(enum libbpf::bpf_prog_type prog_type,
+                                  const char* name)
 {
   struct bpf_insn insns[] = { BPF_MOV64_IMM(BPF_REG_0, 0), BPF_EXIT_INSN() };
-  return try_load(prog_type, insns, ARRAY_SIZE(insns));
+  return try_load(prog_type, insns, ARRAY_SIZE(insns), name);
 }
 
 bool BPFfeature::detect_map(enum libbpf::bpf_map_type map_type)
@@ -278,6 +291,48 @@ bool BPFfeature::has_map_batch()
 #endif
 }
 
+bool BPFfeature::has_d_path(void)
+{
+  if (has_d_path_.has_value())
+    return *has_d_path_;
+
+  struct bpf_insn insns[] = {
+    BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_1, 0),
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
+    BPF_MOV64_IMM(BPF_REG_6, 0),
+    BPF_STX_MEM(BPF_DW, BPF_REG_2, BPF_REG_6, 0),
+    BPF_LD_IMM64(BPF_REG_3, 8),
+    BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, libbpf::BPF_FUNC_d_path),
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+  };
+
+  has_d_path_ = std::make_optional<bool>(try_load(libbpf::BPF_PROG_TYPE_TRACING,
+                                                  insns,
+                                                  ARRAY_SIZE(insns),
+                                                  "kfunc__dentry_open"));
+
+  return *has_d_path_;
+}
+
+bool BPFfeature::has_uprobe_refcnt()
+{
+  if (has_uprobe_refcnt_.has_value())
+    return *has_uprobe_refcnt_;
+
+#ifdef LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE
+  struct stat sb;
+  has_uprobe_refcnt_ =
+      ::stat("/sys/bus/event_source/devices/uprobe/format/ref_ctr_offset",
+             &sb) == 0;
+#else
+  has_uprobe_refcnt_ = false;
+#endif // LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE
+
+  return *has_uprobe_refcnt_;
+}
+
 std::string BPFfeature::report(void)
 {
   std::stringstream buf;
@@ -299,6 +354,7 @@ std::string BPFfeature::report(void)
       << "  send_signal: " << to_str(has_helper_send_signal())
       << "  override_return: " << to_str(has_helper_override_return())
       << "  get_boot_ns: " << to_str(has_helper_ktime_get_boot_ns())
+      << "  dpath: " << to_str(has_d_path())
       << std::endl;
 
   buf << "Kernel features" << std::endl
@@ -306,7 +362,8 @@ std::string BPFfeature::report(void)
       << "  Loop support: " << to_str(has_loop())
       << "  btf (depends on Build:libbpf): " << to_str(has_btf())
       << "  map batch (depends on Build:libbpf): " << to_str(has_map_batch())
-      << std::endl;
+      << "  uprobe refcount (depends on Build:bcc bpf_attach_uprobe refcount): "
+      << to_str(has_uprobe_refcnt()) << std::endl;
 
   buf << "Map types" << std::endl
       << "  hash: " << to_str(has_map_hash())
@@ -321,7 +378,9 @@ std::string BPFfeature::report(void)
       << "  kprobe: " << to_str(has_prog_kprobe())
       << "  tracepoint: " << to_str(has_prog_tracepoint())
       << "  perf_event: " << to_str(has_prog_perf_event())
-      << "  kfunc: " << to_str(has_prog_kfunc()) << std::endl;
+      << "  kfunc: " << to_str(has_prog_kfunc())
+      << "  iter:task: " << to_str(has_prog_iter_task())
+      << "  iter:task_file: " << to_str(has_prog_iter_task_file()) << std::endl;
 
   return buf.str();
 }

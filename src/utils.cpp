@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <glob.h>
+#include <limits>
 #include <link.h>
 #include <map>
 #include <memory>
@@ -16,8 +17,9 @@
 #include <tuple>
 #include <unistd.h>
 
-#include "list.h"
+#include "bpftrace.h"
 #include "log.h"
+#include "probe_matcher.h"
 #include "utils.h"
 #include <bcc/bcc_elf.h>
 #include <bcc/bcc_syms.h>
@@ -148,21 +150,23 @@ bool get_uint64_env_var(const std::string &str, uint64_t &dest)
   return true;
 }
 
+std::string get_pid_exe(const std::string &pid)
+{
+  std::error_code ec;
+  std_filesystem::path proc_path{ "/proc" };
+  proc_path /= pid;
+  proc_path /= "exe";
+
+  if (!std_filesystem::exists(proc_path, ec) ||
+      !std_filesystem::is_symlink(proc_path, ec))
+    return "";
+
+  return std_filesystem::read_symlink(proc_path).string();
+}
+
 std::string get_pid_exe(pid_t pid)
 {
-  char proc_path[512];
-  char exe_path[4096];
-  int res;
-
-  sprintf(proc_path, "/proc/%d/exe", pid);
-  res = readlink(proc_path, exe_path, sizeof(exe_path));
-  if (res == -1)
-    return "";
-  if (res >= static_cast<int>(sizeof(exe_path))) {
-    throw std::runtime_error("executable path exceeded maximum supported size of 4096 characters");
-  }
-  exe_path[res] = '\0';
-  return std::string(exe_path);
+  return get_pid_exe(std::to_string(pid));
 }
 
 bool has_wildcard(const std::string &str)
@@ -296,12 +300,9 @@ std::vector<std::string> get_kernel_cflags(
 
 bool is_dir(const std::string& path)
 {
-  struct stat buf;
-
-  if (::stat(path.c_str(), &buf) < 0)
-    return false;
-
-  return S_ISDIR(buf.st_mode);
+  std::error_code ec;
+  std_filesystem::path buf{ path };
+  return std_filesystem::is_directory(buf, ec);
 }
 
 namespace {
@@ -334,21 +335,23 @@ namespace {
 
   std::string unpack_kheaders_tar_xz(const struct utsname& utsname)
   {
-    std::string path_prefix{"/tmp"};
+    std::error_code ec;
+    std_filesystem::path path_prefix{ "/tmp" };
+    std_filesystem::path path_kheaders{ "/sys/kernel/kheaders.tar.xz" };
     if (const char* tmpdir = ::getenv("TMPDIR")) {
       path_prefix = tmpdir;
     }
-    path_prefix += "/kheaders-";
-    std::string shared_path{path_prefix + utsname.release};
+    path_prefix /= "kheaders-";
+    std_filesystem::path shared_path{ path_prefix.string() + utsname.release };
 
-    struct stat stat_buf;
-
-    if (::stat(shared_path.c_str(), &stat_buf) == 0) {
+    if (std_filesystem::exists(shared_path, ec))
+    {
       // already unpacked
-      return shared_path;
+      return shared_path.string();
     }
 
-    if (::stat("/sys/kernel/kheaders.tar.xz", &stat_buf) != 0) {
+    if (!std_filesystem::exists(path_kheaders, ec))
+    {
       StderrSilencer silencer;
       silencer.silence();
 
@@ -357,7 +360,8 @@ namespace {
         return "";
       }
 
-      if (::stat("/sys/kernel/kheaders.tar.xz", &stat_buf) != 0) {
+      if (!std_filesystem::exists(path_kheaders, ec))
+      {
         return "";
       }
     }
@@ -395,7 +399,9 @@ namespace {
 //
 // {"", ""} is returned if no trace of kernel headers was found at all.
 // Both ksrc and kobj are guaranteed to be != "", if at least some trace of kernel sources was found.
-std::tuple<std::string, std::string> get_kernel_dirs(const struct utsname& utsname)
+std::tuple<std::string, std::string> get_kernel_dirs(
+    const struct utsname &utsname,
+    bool unpack_kheaders)
 {
 #ifdef KERNEL_HEADERS_DIR
   return {KERNEL_HEADERS_DIR, KERNEL_HEADERS_DIR};
@@ -416,17 +422,22 @@ std::tuple<std::string, std::string> get_kernel_dirs(const struct utsname& utsna
   if (!is_dir(kobj)) {
     kobj = "";
   }
-  if (ksrc == "" && kobj == "") {
-    const auto kheaders_tar_xz_path = unpack_kheaders_tar_xz(utsname);
-    if (kheaders_tar_xz_path.size() > 0) {
-      return std::make_tuple(kheaders_tar_xz_path, kheaders_tar_xz_path);
+  if (ksrc.empty() && kobj.empty())
+  {
+    if (unpack_kheaders)
+    {
+      const auto kheaders_tar_xz_path = unpack_kheaders_tar_xz(utsname);
+      if (kheaders_tar_xz_path.size() > 0)
+        return std::make_tuple(kheaders_tar_xz_path, kheaders_tar_xz_path);
     }
     return std::make_tuple("", "");
   }
-  if (ksrc == "") {
+  if (ksrc.empty())
+  {
     ksrc = kobj;
   }
-  else if (kobj == "") {
+  else if (kobj.empty())
+  {
     kobj = ksrc;
   }
 
@@ -599,62 +610,39 @@ namespace, it will throw an exception
 */
 static bool pid_in_different_mountns(int pid)
 {
-
-  struct stat self_stat, target_stat;
-  int self_fd = -1, target_fd = -1;
-  std::stringstream errmsg;
-  char buf[64];
-
   if (pid <= 0)
     return false;
 
-  if ((size_t)snprintf(buf, sizeof(buf), "/proc/%d/ns/mnt", pid) >= sizeof(buf))
+  std::error_code ec;
+  std_filesystem::path self_path{ "/proc/self/ns/mnt" };
+  std_filesystem::path target_path{ "/proc" };
+  target_path /= std::to_string(pid);
+  target_path /= "ns/mnt";
+
+  if (!std_filesystem::exists(self_path, ec))
   {
-    errmsg << "Reading mountNS would overflow buffer.";
-    goto error;
+    throw MountNSException(
+        "Failed to compare mount ns with PID " + std::to_string(pid) +
+        ". The error was open (/proc/self/ns/mnt): " + ec.message());
   }
 
-  self_fd = open("/proc/self/ns/mnt", O_RDONLY);
-  if (self_fd < 0)
+  if (!std_filesystem::exists(target_path, ec))
   {
-    errmsg << "open(/proc/self/ns/mnt): " << strerror(errno);
-    goto error;
+    throw MountNSException(
+        "Failed to compare mount ns with PID " + std::to_string(pid) +
+        ". The error was open (/proc/<pid>/ns/mnt): " + ec.message());
   }
 
-  target_fd = open(buf, O_RDONLY);
-  if (target_fd < 0)
+  bool result = !std_filesystem::equivalent(self_path, target_path, ec);
+
+  if (ec)
   {
-    errmsg << "open(/proc/<pid>/ns/mnt): " << strerror(errno);
-    goto error;
+    throw MountNSException("Failed to compare mount ns with PID " +
+                           std::to_string(pid) +
+                           ". The error was (fstat): " + ec.message());
   }
 
-  if (fstat(self_fd, &self_stat))
-  {
-    errmsg << "fstat(self_fd): " << strerror(errno);
-    goto error;
-  }
-
-  if (fstat(target_fd, &target_stat))
-  {
-    errmsg << "fstat(target_fd)" << strerror(errno);
-    goto error;
-  }
-
-  close(self_fd);
-  close(target_fd);
-  return self_stat.st_ino != target_stat.st_ino;
-
-error:
-  if (self_fd >= 0)
-    close(self_fd);
-  if (target_fd >= 0)
-    close(target_fd);
-
-  throw MountNSException("Failed to compare mount ns with PID " +
-                         std::to_string(pid) + ". " + "The error was " +
-                         errmsg.str());
-
-  return false;
+  return result;
 }
 
 void cat_file(const char *filename, size_t max_bytes, std::ostream &out)
@@ -771,6 +759,9 @@ std::string hex_format_buffer(const char *buf, size_t size)
 
 std::unordered_set<std::string> get_traceable_funcs()
 {
+#ifdef FUZZ
+  return {};
+#else
   // Try to get the list of functions from BPFTRACE_AVAILABLE_FUNCTIONS_TEST env
   const char *path = std::getenv("BPFTRACE_AVAILABLE_FUNCTIONS_TEST");
 
@@ -792,8 +783,14 @@ std::unordered_set<std::string> get_traceable_funcs()
   std::unordered_set<std::string> result;
   std::string line;
   while (std::getline(available_funs, line))
-    result.insert(line);
+  {
+    if (symbol_has_module(line))
+      result.insert(strip_symbol_module(line));
+    else
+      result.insert(line);
+  }
   return result;
+#endif
 }
 
 uint64_t parse_exponent(const char *str)
@@ -806,6 +803,9 @@ uint64_t parse_exponent(const char *str)
 
   auto exp = strtoll(e_offset + 1, nullptr, 10);
   auto num = base * std::pow(10, exp);
+  uint64_t max = std::numeric_limits<uint64_t>::max();
+  if (num > (double)max)
+    throw std::runtime_error(std::string(str) + " is too big for uint64_t");
   return num;
 }
 
@@ -922,10 +922,77 @@ uint32_t kernel_version(int attempt)
   }
 }
 
-std::string abs_path(const std::string &rel_path)
+std::optional<std::string> abs_path(const std::string &rel_path)
 {
-  auto p = std_filesystem::path(rel_path);
-  return std_filesystem::canonical(std_filesystem::absolute(p)).string();
+  // filesystem::canonical does not work very well with /proc/<pid>/root paths
+  // of processes in a different mount namespace (than the one bpftrace is
+  // running in), failing during canonicalization. See iovisor:bpftrace#1595
+  static auto re = std::regex("^/proc/\\d+/root/.*");
+  if (!std::regex_match(rel_path, re))
+  {
+    try
+    {
+      auto p = std_filesystem::path(rel_path);
+      return std_filesystem::canonical(std_filesystem::absolute(p)).string();
+    }
+    catch (std_filesystem::filesystem_error &)
+    {
+      return {};
+    }
+  }
+  else
+  {
+    return rel_path;
+  }
+}
+
+int64_t min_value(const std::vector<uint8_t> &value, int nvalues)
+{
+  int64_t val, max = 0, retval;
+  for (int i = 0; i < nvalues; i++)
+  {
+    val = read_data<int64_t>(value.data() + i * sizeof(int64_t));
+    if (val > max)
+      max = val;
+  }
+
+  /*
+   * This is a hack really until the code generation for the min() function
+   * is sorted out. The way it is currently implemented doesn't allow >
+   * 32 bit quantities and also means we have to do gymnastics with the return
+   * value owing to the way it is stored (i.e., 0xffffffff - val).
+   */
+  if (max == 0) /* If we have applied the zero() function */
+    retval = max;
+  else if ((0xffffffff - max) <= 0) /* A negative 32 bit value */
+    retval = 0 - (max - 0xffffffff);
+  else
+    retval = 0xffffffff - max; /* A positive 32 bit value */
+
+  return retval;
+}
+
+uint64_t max_value(const std::vector<uint8_t> &value, int nvalues)
+{
+  uint64_t val, max = 0;
+  for (int i = 0; i < nvalues; i++)
+  {
+    val = read_data<uint64_t>(value.data() + i * sizeof(uint64_t));
+    if (val > max)
+      max = val;
+  }
+  return max;
+}
+
+bool symbol_has_module(const std::string &symbol)
+{
+  return !symbol.empty() && symbol[symbol.size() - 1] == ']';
+}
+
+std::string strip_symbol_module(const std::string &symbol)
+{
+  size_t idx = symbol.rfind(" [");
+  return idx != std::string::npos ? symbol.substr(0, idx) : symbol;
 }
 
 } // namespace bpftrace

@@ -1,8 +1,8 @@
 #include "btf.h"
 #include "arch/arch.h"
 #include "bpftrace.h"
-#include "list.h"
 #include "log.h"
+#include "probe_matcher.h"
 #include "types.h"
 #include "utils.h"
 #include <cstring>
@@ -23,6 +23,8 @@
 #include <bpf/btf.h>
 #pragma GCC diagnostic pop
 #include <bpf/libbpf.h>
+
+#include "bpftrace.h"
 
 namespace bpftrace {
 
@@ -115,7 +117,7 @@ static struct btf *btf_open(const struct vmlinux_location *locs)
 
     if (err)
     {
-      if (bt_verbose)
+      if (bt_debug != DebugLevel::kNone)
       {
         char err_buf[256];
 
@@ -126,7 +128,7 @@ static struct btf *btf_open(const struct vmlinux_location *locs)
       continue;
     }
 
-    if (bt_verbose)
+    if (bt_debug != DebugLevel::kNone)
     {
       std::cerr << "BTF: using data from " << path << std::endl;
     }
@@ -158,7 +160,6 @@ BTF::BTF(void) : btf(nullptr), state(NODATA)
   if (btf)
   {
     libbpf_set_print(libbpf_print);
-    traceable_funcs_ = get_traceable_funcs();
     state = OK;
   }
   else if (bt_debug != DebugLevel::kNone)
@@ -392,7 +393,11 @@ SizedType BTF::get_stype(__u32 id)
     const char *cast = btf_str(btf, t->name_off);
     assert(cast);
     std::string comp = btf_is_struct(t) ? "struct" : "union";
-    stype = CreateRecord(0, comp + " " + cast);
+    std::string name = comp + " " + cast;
+    // We're usually resolving types before running ClangParser, so the struct
+    // definitions are not yet pulled into the struct map. We initialize them
+    // now and fill them later.
+    stype = CreateRecord(name, bpftrace_->structs.LookupOrAdd(name, t->size));
   }
   else if (btf_is_ptr(t))
   {
@@ -431,9 +436,9 @@ int BTF::resolve_args(const std::string &func,
       throw std::runtime_error("not a function");
     }
 
-    if (!is_traceable_func(name))
+    if (bpftrace_ && !bpftrace_->is_traceable_func(name))
     {
-      if (traceable_funcs_.empty())
+      if (bpftrace_->traceable_funcs_.empty())
         throw std::runtime_error("could not read traceable functions from " +
                                  kprobe_path + " (is debugfs mounted?)");
       else
@@ -479,24 +484,7 @@ int BTF::resolve_args(const std::string &func,
   throw std::runtime_error("no BTF data for the function");
 }
 
-static bool match_re(const std::string &probe, const std::regex &re)
-{
-  try
-  {
-    if (std::regex_search(probe, re))
-      return true;
-    else
-      return false;
-  }
-  catch (std::regex_error &e)
-  {
-    return false;
-  }
-}
-
-std::unique_ptr<std::istream> BTF::get_funcs(std::regex *re,
-                                             bool params,
-                                             std::string prefix) const
+std::unique_ptr<std::istream> BTF::get_all_funcs() const
 {
   __s32 id, max = (__s32)btf__get_nr_types(btf);
   std::string type = std::string("");
@@ -536,61 +524,13 @@ std::unique_ptr<std::istream> BTF::get_funcs(std::regex *re,
       break;
     }
 
-    if (!is_traceable_func(func_name))
+    if (bpftrace_ && !bpftrace_->is_traceable_func(func_name))
       continue;
 
     if (btf_vlen(t) > arch::max_arg() + 1)
       continue;
 
-    if (re && !match_re(prefix + func_name, *re))
-      continue;
-
-    funcs += prefix + std::string(func_name) + "\n";
-
-#ifdef HAVE_LIBBPF_BTF_DUMP_EMIT_TYPE_DECL
-
-    if (!params)
-      continue;
-
-    DECLARE_LIBBPF_OPTS(btf_dump_emit_type_decl_opts,
-                        decl_opts,
-                        .field_name = "",
-                        .indent_level = 0, );
-
-    const struct btf_param *p;
-    int j;
-
-    for (j = 0, p = btf_params(t); j < btf_vlen(t); j++, p++)
-    {
-      // set by dump_printf callback
-      type = std::string("");
-      const char *arg_name = btf__name_by_offset(btf, p->name_off);
-
-      err = btf_dump__emit_type_decl(dump, p->type, &decl_opts);
-      if (err)
-      {
-        LOG(ERROR) << "failed to dump argument: " << arg_name;
-        break;
-      }
-
-      funcs += "    " + type + " " + arg_name + ";\n";
-    }
-
-    if (!t->type)
-      continue;
-
-    // set by dump_printf callback
-    type = std::string("");
-
-    err = btf_dump__emit_type_decl(dump, t->type, &decl_opts);
-    if (err)
-    {
-      LOG(ERROR) << "failed to dump type for: " << func_name;
-      break;
-    }
-
-    funcs += "    " + type + " retval;\n";
-#endif
+    funcs += std::string(func_name) + "\n";
   }
 
   if (id != (max + 1))
@@ -601,28 +541,10 @@ std::unique_ptr<std::istream> BTF::get_funcs(std::regex *re,
   return std::make_unique<std::istringstream>(funcs);
 }
 
-void BTF::display_kfunc(std::regex *re, const bool retprobe = false) const
+std::map<std::string, std::vector<std::string>> BTF::get_params(
+    const std::set<std::string> &funcs) const
 {
-  if (!has_data())
-    return;
-
-  auto funcs = get_funcs(re, bt_verbose, retprobe ? "kretfunc:" : "kfunc:");
-  if (!funcs)
-    return;
-
-  std::string func_name;
-  while (std::getline(*funcs, func_name))
-  {
-    std::cout << func_name << std::endl;
-  }
-}
-
-void BTF::display_structs(std::regex *re) const
-{
-  if (!has_data())
-    return;
-
-  std::unordered_set<std::string> struct_set;
+#ifdef HAVE_LIBBPF_BTF_DUMP_EMIT_TYPE_DECL
   __s32 id, max = (__s32)btf__get_nr_types(btf);
   std::string type = std::string("");
   struct btf_dump_opts opts = {
@@ -638,7 +560,101 @@ void BTF::display_structs(std::regex *re) const
   {
     libbpf_strerror(err, err_buf, sizeof(err_buf));
     LOG(ERROR) << "BTF: failed to initialize dump (" << err_buf << ")";
-    return;
+    return {};
+  }
+
+  std::map<std::string, std::vector<std::string>> params;
+  for (id = 1; id <= max; id++)
+  {
+    const struct btf_type *t = btf__type_by_id(btf, id);
+
+    if (!btf_is_func(t))
+      continue;
+
+    const char *str = btf__name_by_offset(btf, t->name_off);
+    std::string func_name = str;
+
+    if (funcs.find(func_name) == funcs.end())
+      continue;
+
+    t = btf__type_by_id(btf, t->type);
+
+    _Pragma("GCC diagnostic push")
+        _Pragma("GCC diagnostic ignored \"-Wmissing-field-initializers\"")
+
+            DECLARE_LIBBPF_OPTS(btf_dump_emit_type_decl_opts,
+                                decl_opts,
+                                .field_name = "");
+
+    _Pragma("GCC diagnostic pop")
+
+        const struct btf_param *p;
+    int j;
+
+    for (j = 0, p = btf_params(t); j < btf_vlen(t); j++, p++)
+    {
+      // set by dump_printf callback
+      type = std::string("");
+      const char *arg_name = btf__name_by_offset(btf, p->name_off);
+
+      err = btf_dump__emit_type_decl(dump, p->type, &decl_opts);
+      if (err)
+      {
+        LOG(ERROR) << "failed to dump argument: " << arg_name;
+        break;
+      }
+
+      params[func_name].push_back(type + " " + arg_name);
+    }
+
+    if (!t->type)
+      continue;
+
+    // set by dump_printf callback
+    type = std::string("");
+
+    err = btf_dump__emit_type_decl(dump, t->type, &decl_opts);
+    if (err)
+    {
+      LOG(ERROR) << "failed to dump return type for: " << func_name;
+      break;
+    }
+
+    params[func_name].push_back(type + " retval");
+  }
+
+  if (id != (max + 1))
+    LOG(ERROR) << "BTF data inconsistency " << id << "," << max;
+
+  btf_dump__free(dump);
+
+  return params;
+#else
+  LOG(ERROR) << "Could not get kfunc arguments "
+                "(HAVE_LIBBPF_BTF_DUMP_EMIT_TYPE_DECL is not set)" return {};
+  return {};
+#endif
+}
+
+std::set<std::string> BTF::get_all_structs() const
+{
+  std::set<std::string> struct_set;
+  __s32 id, max = (__s32)btf__get_nr_types(btf);
+  std::string types = std::string("");
+  struct btf_dump_opts opts = {
+    .ctx = &types,
+  };
+  struct btf_dump *dump;
+  char err_buf[256];
+  int err;
+
+  dump = btf_dump__new(btf, nullptr, &opts, dump_printf);
+  err = libbpf_get_error(dump);
+  if (err)
+  {
+    libbpf_strerror(err, err_buf, sizeof(err_buf));
+    LOG(ERROR) << "BTF: failed to initialize dump (" << err_buf << ")";
+    return {};
   }
 
   for (id = 1; id <= max; id++)
@@ -653,10 +669,10 @@ void BTF::display_structs(std::regex *re) const
     if (name.find("(anon)") != std::string::npos)
       continue;
 
-    if (re && !match_re(name, *re))
-      continue;
-
-    struct_set.insert(name);
+    if (bt_verbose)
+      btf_dump__dump_type(dump, id);
+    else
+      struct_set.insert(name);
   }
 
   if (id != (max + 1))
@@ -664,42 +680,36 @@ void BTF::display_structs(std::regex *re) const
 
   btf_dump__free(dump);
 
-  if (struct_set.empty())
-    return;
-
-  std::vector<std::string> vec(struct_set.begin(), struct_set.end());
-  std::sort(vec.begin(), vec.end());
   if (bt_verbose)
   {
-    std::string def = c_def(struct_set);
-    // c_def() contains all the necessary dependent types needed for
-    // compilation. Print definition of given structs (or union/enum) only
-    for (const auto &name : vec)
+    // BTF dump contains definitions of all types in a single string, here we
+    // split it
+    std::istringstream type_stream(types);
+    std::string line, type;
+    bool in_def = false;
+    while (std::getline(type_stream, line))
     {
-      auto start = def.find(name + " {");
-      auto end = std::min(def.find("\n};", start) + 3, def.size());
-      if (start == std::string::npos)
-        continue;
-      for (auto i = start; i < end; i++)
-        std::cout << def[i];
-      std::cout << std::endl;
+      if (in_def)
+      {
+        type += line + "\n";
+        if (line == "};")
+        {
+          // end of type definition
+          struct_set.insert(type);
+          type.clear();
+          in_def = false;
+        }
+      }
+      else if (!line.empty() && line.back() == '{')
+      {
+        // start of type definition
+        type += line + "\n";
+        in_def = true;
+      }
     }
   }
-  else
-  {
-    for (const auto &name : vec)
-      std::cout << name << std::endl;
-  }
-}
 
-std::unique_ptr<std::istream> BTF::kfunc(void) const
-{
-  return get_funcs(NULL, false, "");
-}
-
-bool BTF::is_traceable_func(const std::string &func_name) const
-{
-  return traceable_funcs_.find(func_name) != traceable_funcs_.end();
+  return struct_set;
 }
 
 } // namespace bpftrace
@@ -730,18 +740,20 @@ int BTF::resolve_args(const std::string &func __attribute__((__unused__)),
   return -1;
 }
 
-void BTF::display_kfunc(std::regex* re __attribute__((__unused__)),
-                        const bool retporbe __attribute__((__unused__))) const
+std::set<std::string> BTF::get_all_structs() const
 {
+  return {};
 }
 
-std::unique_ptr<std::istream> BTF::kfunc(void) const
+std::unique_ptr<std::istream> BTF::get_all_funcs() const
 {
   return nullptr;
 }
 
-void BTF::display_structs(std::regex* re __attribute__((__unused__))) const
+std::map<std::string, std::vector<std::string>> BTF::get_params(
+    const std::set<std::string>& funcs __attribute__((__unused__))) const
 {
+  return {};
 }
 } // namespace bpftrace
 

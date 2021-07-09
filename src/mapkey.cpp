@@ -17,7 +17,7 @@ size_t MapKey::size() const
 {
   size_t size = 0;
   for (auto &arg : args_)
-    size += arg.size;
+    size += arg.GetSize();
   return size;
 }
 
@@ -43,7 +43,7 @@ std::vector<std::string> MapKey::argument_value_list(BPFtrace &bpftrace,
   for (const SizedType &arg : args_)
   {
     list.push_back(argument_value(bpftrace, arg, &data[offset]));
-    offset += arg.size;
+    offset += arg.GetSize();
   }
   return list;
 }
@@ -65,7 +65,7 @@ std::string MapKey::argument_value(BPFtrace &bpftrace,
   switch (arg.type)
   {
     case Type::integer:
-      switch (arg.size)
+      switch (arg.GetSize())
       {
         case 1:
           return std::to_string(read_data<int8_t>(data));
@@ -101,22 +101,49 @@ std::string MapKey::argument_value(BPFtrace &bpftrace,
     case Type::username:
       return bpftrace.resolve_uid(read_data<uint64_t>(data));
     case Type::probe:
-      return bpftrace.probe_ids_[read_data<uint64_t>(data)];
+      return bpftrace.resources.probe_ids[read_data<uint64_t>(data)];
     case Type::string:
     {
       auto p = static_cast<const char *>(data);
-      return std::string(p, strnlen(p, arg.size));
+      return std::string(p, strnlen(p, arg.GetSize()));
     }
     case Type::buffer:
     {
       auto p = static_cast<const char *>(data) + 1;
-      return hex_format_buffer(p, arg.size - 1);
+      return hex_format_buffer(p, arg.GetSize() - 1);
     }
     case Type::pointer:
     {
       // use case: show me these pointer values
       ptr << "0x" << std::hex << read_data<int64_t>(data);
       return ptr.str();
+    }
+    case Type::array:
+    {
+      std::vector<std::string> elems;
+      for (size_t i = 0; i < arg.GetNumElements(); i++)
+        elems.push_back(argument_value(bpftrace,
+                                       *arg.GetElementTy(),
+                                       (const uint8_t *)data +
+                                           i * arg.GetElementTy()->GetSize()));
+      return "[" + str_join(elems, ",") + "]";
+    }
+    case Type::record:
+    {
+      std::vector<std::string> elems;
+      for (auto &field : arg.GetFields())
+      {
+        elems.push_back("." + field.name + "=" +
+                        argument_value(bpftrace,
+                                       field.type,
+                                       (const uint8_t *)data + field.offset));
+      }
+      return "{" + str_join(elems, ",") + "}";
+    }
+    case Type::mac_address:
+    {
+      auto p = static_cast<const uint8_t *>(data);
+      return bpftrace.resolve_mac_address(p);
     }
     default:
       LOG(ERROR) << "invalid mapkey argument type";

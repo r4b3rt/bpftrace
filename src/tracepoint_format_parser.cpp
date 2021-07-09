@@ -3,7 +3,7 @@
 #include <glob.h>
 #include <iostream>
 
-#include "ast.h"
+#include "ast/ast.h"
 #include "bpftrace.h"
 #include "log.h"
 #include "struct.h"
@@ -31,7 +31,7 @@ bool TracepointFormatParser::parse(ast::Program *program, BPFtrace &bpftrace)
     program->c_definitions += "#include <linux/types.h>\n";
   for (ast::Probe *probe : probes_with_tracepoint)
   {
-    n.analyse(probe);
+    n.visit(*probe);
 
     for (ast::AttachPoint *ap : *probe->attach_points)
     {
@@ -70,8 +70,11 @@ bool TracepointFormatParser::parse(ast::Program *program, BPFtrace &bpftrace)
             }
           }
 
-          if (!probe->need_tp_args_structs)
+          if (probe->tp_args_structs_level <= 0)
+          {
+            globfree(&glob_result);
             continue;
+          }
 
           for (size_t i = 0; i < glob_result.gl_pathc; ++i) {
             std::string filename(glob_result.gl_pathv[i]);
@@ -119,7 +122,7 @@ bool TracepointFormatParser::parse(ast::Program *program, BPFtrace &bpftrace)
             return false;
           }
 
-          if (!probe->need_tp_args_structs)
+          if (probe->tp_args_structs_level <= 0)
             continue;
 
           // Check to avoid adding the same struct more than once to definitions
@@ -214,11 +217,8 @@ std::string TracepointFormatParser::parse_field(const std::string &line,
   if (field_name.find("[") == std::string::npos)
     field_type = adjust_integer_types(field_type, size);
 
-  // With --btf on, we try not to use any header files, including
-  // <linux/types.h>. That means we must request all the types we need
-  // from BTF. Note we don't need to gate this on --btf because the
-  // expensive type reslution is already gated on --btf (adding to a set
-  // is cheap).
+  // If BTF is available, we try not to use any header files, including
+  // <linux/types.h> and request all the types we need from BTF.
   bpftrace.btf_set_.emplace(field_type);
 
   return extra + "  " + field_type + " " + field_name + ";\n";

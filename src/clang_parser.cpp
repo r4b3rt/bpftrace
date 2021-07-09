@@ -5,10 +5,10 @@
 
 #include "llvm/Config/llvm-config.h"
 
-#include "ast.h"
+#include "ast/ast.h"
+#include "ast/field_analyser.h"
 #include "btf.h"
 #include "clang_parser.h"
-#include "field_analyser.h"
 #include "headers.h"
 #include "log.h"
 #include "types.h"
@@ -221,11 +221,27 @@ static bool getBitfield(CXCursor c, Bitfield &bitfield)
 
   size_t bitfield_offset = clang_Cursor_getOffsetOfField(c) % 8;
   size_t bitfield_bitwidth = clang_getFieldDeclBitWidth(c);
+  size_t bitfield_bitdidth_max = sizeof(uint64_t) * 8;
 
-  bitfield.mask = (1 << bitfield_bitwidth) - 1;
-  bitfield.access_rshift = bitfield_offset;
+  if (bitfield_bitwidth > bitfield_bitdidth_max)
+  {
+    LOG(WARNING) << "bitfiled bitwidth " << bitfield_bitwidth
+                 << "is not supporeted."
+                 << " Use bitwidth " << bitfield_bitdidth_max;
+    bitfield_bitwidth = bitfield_bitdidth_max;
+  }
+  if (bitfield_bitwidth == bitfield_bitdidth_max)
+    bitfield.mask = std::numeric_limits<uint64_t>::max();
+  else
+    bitfield.mask = (1ULL << bitfield_bitwidth) - 1;
   // Round up to nearest byte
   bitfield.read_bytes = (bitfield_offset + bitfield_bitwidth + 7) / 8;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  bitfield.access_rshift = bitfield_offset;
+#else
+  bitfield.access_rshift = (bitfield.read_bytes * 8 - bitfield_offset -
+                            bitfield_bitwidth);
+#endif
 
   return true;
 }
@@ -276,7 +292,7 @@ static std::string get_unqualified_type_name(CXType clang_type)
   return remove_qualifiers(get_clang_string(clang_getTypeSpelling(clang_type)));
 }
 
-static SizedType get_sized_type(CXType clang_type)
+static SizedType get_sized_type(CXType clang_type, StructManager &structs)
 {
   auto size = 8 * clang_Type_getSizeOf(clang_type);
   auto typestr = get_unqualified_type_name(clang_type);
@@ -291,8 +307,12 @@ static SizedType get_sized_type(CXType clang_type)
     case CXType_ULong:
     case CXType_ULongLong:
       return CreateUInt(size);
-    case CXType_Record:
-      return CreateRecord(size / 8, typestr);
+    case CXType_Record: {
+      // Struct map entry may not exist for forward declared types so we create
+      // it now and fill it later
+      auto s = structs.LookupOrAdd(typestr, size / 8);
+      return CreateRecord(typestr, s);
+    }
     case CXType_Char_S:
     case CXType_SChar:
     case CXType_Short:
@@ -305,7 +325,7 @@ static SizedType get_sized_type(CXType clang_type)
     case CXType_Pointer:
     {
       auto pointee_type = clang_getPointeeType(clang_type);
-      return CreatePointer(get_sized_type(pointee_type));
+      return CreatePointer(get_sized_type(pointee_type, structs));
     }
     case CXType_ConstantArray:
     {
@@ -316,14 +336,8 @@ static SizedType get_sized_type(CXType clang_type)
         return CreateString(size);
       }
 
-      // Only support one-dimensional arrays for now
-      if (elem_type.kind != CXType_ConstantArray)
-      {
-        auto elem_stype = get_sized_type(elem_type);
-        return CreateArray(size, elem_stype);
-      } else {
-        return CreateNone();
-      }
+      auto elem_stype = get_sized_type(elem_type, structs);
+      return CreateArray(size, elem_stype);
     }
     default:
       return CreateNone();
@@ -353,6 +367,9 @@ CXErrorCode ClangParser::ClangParserHandler::parse_translation_unit(
     unsigned num_unsaved_files,
     unsigned options)
 {
+  // Clean up previous translation unit to prevent resource leak
+  clang_disposeTranslationUnit(translation_unit);
+
   return clang_parseTranslationUnit2(
       index,
       source_filename,
@@ -364,7 +381,6 @@ CXErrorCode ClangParser::ClangParserHandler::parse_translation_unit(
 
 bool ClangParser::ClangParserHandler::check_diagnostics(
     const std::string &input,
-    std::vector<std::string> &error_msgs,
     bool bail_on_error)
 {
   for (unsigned int i=0; i < clang_getNumDiagnostics(get_translation_unit()); i++) {
@@ -389,6 +405,62 @@ bool ClangParser::ClangParserHandler::check_diagnostics(
 
 CXCursor ClangParser::ClangParserHandler::get_translation_unit_cursor() {
   return clang_getTranslationUnitCursor(translation_unit);
+}
+
+bool ClangParser::ClangParserHandler::parse_file(
+    const std::string &filename,
+    const std::string &input,
+    const std::vector<const char *> &args,
+    std::vector<CXUnsavedFile> &unsaved_files,
+    bool bail_on_errors)
+{
+  StderrSilencer silencer;
+  if (!bail_on_errors)
+    silencer.silence();
+
+  CXErrorCode error = parse_translation_unit(
+      filename.c_str(),
+      args.data(),
+      args.size(),
+      unsaved_files.data(),
+      unsaved_files.size(),
+      CXTranslationUnit_DetailedPreprocessingRecord);
+
+  error_msgs.clear();
+  if (error)
+  {
+    if (bt_debug == DebugLevel::kFullDebug)
+      LOG(ERROR) << "Clang error while parsing C definitions: " << error;
+    return false;
+  }
+
+  return check_diagnostics(input, bail_on_errors);
+}
+
+const std::vector<std::string>
+    &ClangParser::ClangParserHandler::get_error_messages()
+{
+  return error_msgs;
+}
+
+bool ClangParser::ClangParserHandler::has_redefinition_error()
+{
+  for (auto &msg : error_msgs)
+  {
+    if (msg.find("redefinition") != std::string::npos)
+      return true;
+  }
+  return false;
+}
+
+bool ClangParser::ClangParserHandler::has_unknown_type_error()
+{
+  for (auto &msg : error_msgs)
+  {
+    if (ClangParser::get_unknown_type(msg).has_value())
+      return true;
+  }
+  return false;
 }
 
 namespace {
@@ -458,7 +530,7 @@ bool ClangParser::visit_children(CXCursor &cursor, BPFtrace &bpftrace)
 
         if (clang_getCursorKind(c) == CXCursor_FieldDecl)
         {
-          auto &structs = static_cast<BPFtrace*>(client_data)->structs_;
+          auto &structs = static_cast<BPFtrace *>(client_data)->structs;
 
           auto named_parent = get_named_parent(c);
           auto ptype = clang_getCanonicalType(clang_getCursorType(named_parent));
@@ -468,7 +540,7 @@ bool ClangParser::visit_children(CXCursor &cursor, BPFtrace &bpftrace)
           auto ident = get_clang_string(clang_getCursorSpelling(c));
           auto offset = clang_Type_getOffsetOf(ptype, ident.c_str()) / 8;
           auto type = clang_getCanonicalType(clang_getCursorType(c));
-          auto sized_type = get_sized_type(type);
+          auto sized_type = get_sized_type(type, structs);
           Bitfield bitfield;
           bool is_bitfield = getBitfield(c, bitfield);
           bool is_data_loc = false;
@@ -490,15 +562,15 @@ bool ClangParser::visit_children(CXCursor &cursor, BPFtrace &bpftrace)
             }
           }
 
+          // Initialize a new record type if needed
+          if (!structs.Has(ptypestr))
+            structs.Add(ptypestr, ptypesize);
+
           // No need to worry about redefined types b/c we should have already
           // checked clang diagnostics. The diagnostics will tell us if we have
           // duplicated types.
-          structs[ptypestr].fields[ident].offset = offset;
-          structs[ptypestr].fields[ident].type = sized_type;
-          structs[ptypestr].fields[ident].is_bitfield = is_bitfield;
-          structs[ptypestr].fields[ident].bitfield = bitfield;
-          structs[ptypestr].fields[ident].is_data_loc = is_data_loc;
-          structs[ptypestr].size = ptypesize;
+          structs.Lookup(ptypestr).lock()->AddField(
+              ident, sized_type, offset, is_bitfield, bitfield, is_data_loc);
         }
 
         return CXChildVisit_Recurse;
@@ -510,49 +582,15 @@ bool ClangParser::visit_children(CXCursor &cursor, BPFtrace &bpftrace)
   return err == 0;
 }
 
-std::unordered_set<std::string> ClangParser::get_incomplete_types(
-    const std::string &input,
-    std::vector<CXUnsavedFile> &unsaved_files,
-    const std::vector<const char *> &args,
-    const std::unordered_set<std::string> &complete_types)
+std::unordered_set<std::string> ClangParser::get_incomplete_types()
 {
   if (input.empty())
     return {};
 
+  // Parse without failing on compilation errors (ie incomplete structs) because
+  // our goal is to enumerate all such errors.
   ClangParserHandler handler;
-  CXErrorCode error;
-  {
-    // No need to print warnings/errors twice. We will parse the input again
-    // later.
-    StderrSilencer silencer;
-    silencer.silence();
-
-    error = handler.parse_translation_unit(
-        "definitions.h",
-        args.data(),
-        args.size(),
-        unsaved_files.data(),
-        unsaved_files.size(),
-        CXTranslationUnit_DetailedPreprocessingRecord);
-  }
-
-  if (error)
-  {
-    if (bt_debug == DebugLevel::kFullDebug)
-      LOG(ERROR)
-          << "Clang error while parsing BTF dependencies in C definitions: "
-          << error;
-
-    // We don't need to worry about properly reporting an error here because
-    // clang should fail again when we run the parser the second time.
-    return {};
-  }
-
-  // Don't bail on errors (ie incomplete structs) because our goal is to
-  // enumerate all such errors. Instead, collect error messages for later
-  // analysis.
-  std::vector<std::string> diag_msgs;
-  if (!handler.check_diagnostics(input, diag_msgs, false))
+  if (!handler.parse_file("definitions.h", input, args, input_files, false))
     return {};
 
   struct TypeData
@@ -560,19 +598,6 @@ std::unordered_set<std::string> ClangParser::get_incomplete_types(
     std::unordered_set<std::string> complete_types;
     std::unordered_set<std::string> incomplete_types;
   } type_data;
-  // Initialize to already defined types
-  type_data.complete_types = complete_types;
-
-  // Search for error messages of the form:
-  //   unknown type name 'type_t'
-  // that imply an unresolved typedef of type_t. This cannot be done below in
-  // clang_visitChildren since clang does not have the unknown type names.
-  for (const auto &msg : diag_msgs)
-  {
-    auto unknown_type = get_unknown_type(msg);
-    if (unknown_type)
-      type_data.incomplete_types.emplace(unknown_type.value());
-  }
 
   CXCursor cursor = handler.get_translation_unit_cursor();
   clang_visitChildren(
@@ -616,101 +641,158 @@ std::unordered_set<std::string> ClangParser::get_incomplete_types(
   return type_data.incomplete_types;
 }
 
+void ClangParser::resolve_incomplete_types_from_btf(
+    BPFtrace &bpftrace,
+    const ast::ProbeList *probes)
+{
+  // Resolution of incomplete types must run at least once, maximum should be
+  // the number of levels of nested field accesses for tracepoint args.
+  // The maximum number of iterations can be also controlled by the
+  // BPFTRACE_MAX_TYPE_RES_ITERATIONS env variable (0 is unlimited).
+  uint64_t field_lvl = 1;
+  for (auto &probe : *probes)
+    if (probe->tp_args_structs_level > (int)field_lvl)
+      field_lvl = probe->tp_args_structs_level;
+
+  unsigned max_iterations = std::max(bpftrace.max_type_res_iterations,
+                                     field_lvl);
+
+  bool check_incomplete_types = true;
+  for (unsigned i = 0; i < max_iterations && check_incomplete_types; i++)
+  {
+    // Collect incomplete types and retrieve their definitions from BTF.
+    auto incomplete_types = get_incomplete_types();
+    size_t types_cnt = bpftrace.btf_set_.size();
+    bpftrace.btf_set_.insert(incomplete_types.cbegin(),
+                             incomplete_types.cend());
+
+    input_files.back() = get_btf_generated_header(bpftrace);
+
+    // No need to continue if no more types were added
+    check_incomplete_types = types_cnt != bpftrace.btf_set_.size();
+  }
+}
+
+/*
+ * Parse the program using Clang.
+ *
+ * Type resolution rules:
+ *
+ * If BTF is available, necessary types are retrieved from there, otherwise we
+ * rely on headers and types supplied by the user (we also include linux/types.h
+ * in some cases, e.g., for tracepoints).
+ *
+ * The following types are taken from BTF (if available):
+ * 1. Types explicitly used in the program (taken from bpftrace.btf_set_).
+ * 2. Types used by some of the defined types (as struct members). This step
+ *    is done recursively, however, as it may take long time, there is a
+ *    maximal depth set. It is computed as the maximum level of nested field
+ *    accesses in the program and can be manually overridden using
+ *    the BPFTRACE_MAX_TYPE_RES_ITERATIONS env variable.
+ * 3. Typedefs used by some of the defined types. These are also resolved
+ *    recursively, however, they must be resolved completely as any unknown
+ *    typedef will cause the parser to fail (even if the type is not used in
+ *    the program).
+ *
+ * If any of the above steps retrieves a definition that redefines some existing
+ * (user-defined) type, no BTF types are used and all types must be provided.
+ * In practice, this means that user may use kernel types without providing
+ * their definitions but once he redefines any kernel type, he must provide all
+ * necessary definitions.
+ */
 bool ClangParser::parse(ast::Program *program, BPFtrace &bpftrace, std::vector<std::string> extra_flags)
 {
-  auto input = "#include <__btf_generated_header.h>\n" + program->c_definitions;
+#ifdef FUZZ
+  StderrSilencer silencer;
+  silencer.silence();
+#endif
+  input = "#include <__btf_generated_header.h>\n" + program->c_definitions;
 
-  auto input_files = getTranslationUnitFiles(CXUnsavedFile{
+  input_files = getTranslationUnitFiles(CXUnsavedFile{
       .Filename = "definitions.h",
       .Contents = input.c_str(),
       .Length = input.size(),
   });
 
-  std::vector<const char *> args =
-  {
+  // clang-format off
+  args = {
     "-isystem", "/usr/local/include",
     "-isystem", "/bpftrace/include",
     "-isystem", "/usr/include",
   };
+  // clang-format on
   for (auto &flag : extra_flags)
   {
     args.push_back(flag.c_str());
   }
 
-  bool process_btf = program->c_definitions.empty() ||
-                     (bpftrace.force_btf_ && bpftrace.btf_.has_data());
+  // Push the generated BTF header into input files.
+  // The header must be the last file in the vector since the following methods
+  // count on it.
+  // If BTF is not available, the header is empty.
+  input_files.emplace_back(bpftrace.btf_.has_data()
+                               ? get_btf_generated_header(bpftrace)
+                               : get_empty_btf_generated_header());
 
-  // We set these args early because some systems may not have <linux/types.h>
-  // (containers) and fully rely on BTF.
-  if (process_btf)
+  bool btf_conflict = false;
+  ClangParserHandler handler;
+  if (bpftrace.btf_.has_data())
   {
+    // We set these args early because some systems may not have <linux/types.h>
+    // (containers) and fully rely on BTF.
+
     // Prevent BTF generated header from redefining stuff found
     // in <linux/types.h>
     args.push_back("-D_LINUX_TYPES_H");
     // Since we're omitting <linux/types.h> there's no reason to
     // add the wokarounds for it
     args.push_back("-D__CLANG_WORKAROUNDS_H");
-  }
 
-  // The generated BTF header is initially empty
-  std::string btf_cdef;
-  input_files.emplace_back(CXUnsavedFile{
-      .Filename = "/bpftrace/include/__btf_generated_header.h",
-      .Contents = btf_cdef.c_str(),
-      .Length = btf_cdef.size(),
-  });
+    if (handler.parse_file("definitions.h", input, args, input_files, false) &&
+        handler.has_redefinition_error())
+      btf_conflict = true;
 
-  ClangParserHandler handler;
-  bool check_additional_types = true;
-  while (check_additional_types && process_btf)
-  {
-    auto incomplete_types = get_incomplete_types(
-        input, input_files, args, bpftrace.btf_set_);
-    size_t types_cnt = bpftrace.btf_set_.size();
-    bpftrace.btf_set_.insert(incomplete_types.cbegin(),
-                             incomplete_types.cend());
-
-    // Update generated header with current BTF types
-    btf_cdef = bpftrace.btf_.c_def(bpftrace.btf_set_);
-    input_files.back() = CXUnsavedFile{
-      .Filename = "/bpftrace/include/__btf_generated_header.h",
-      .Contents = btf_cdef.c_str(),
-      .Length = btf_cdef.size(),
-    };
-
-    // If additional BTF types were found, we need to repeat the process since
-    // that might have introduced some new unresolved typedefs.
-    check_additional_types = types_cnt != bpftrace.btf_set_.size();
-  }
-
-  CXErrorCode error;
-  error = handler.parse_translation_unit(
-      "definitions.h",
-      args.data(),
-      args.size(),
-      input_files.data(),
-      input_files.size(),
-      CXTranslationUnit_DetailedPreprocessingRecord);
-
-  if (error)
-  {
-    if (bt_debug == DebugLevel::kFullDebug) {
-      LOG(ERROR) << "Clang error while parsing C definitions: " << error
-                 << "Input (" << input.size() << "): " << input;
-    }
-    return false;
-  }
-
-  std::vector<std::string> error_msgs;
-  if (!handler.check_diagnostics(input, error_msgs, true))
-  {
-    for (auto &msg : error_msgs)
+    if (!btf_conflict)
     {
-      if (get_unknown_type(msg) != "" && !bpftrace.force_btf_)
-      {
-        LOG(ERROR) << "Try running with --btf to force BTF processing or "
-                      "include headers with missing type definitions";
-      }
+      resolve_incomplete_types_from_btf(bpftrace, program->probes);
+
+      if (handler.parse_file(
+              "definitions.h", input, args, input_files, false) &&
+          handler.has_redefinition_error())
+        btf_conflict = true;
+    }
+
+    if (!btf_conflict)
+    {
+      resolve_unknown_typedefs_from_btf(bpftrace);
+
+      if (handler.parse_file(
+              "definitions.h", input, args, input_files, false) &&
+          handler.has_redefinition_error())
+        btf_conflict = true;
+    }
+  }
+
+  if (btf_conflict)
+  {
+    // There is a conflict (redefinition) between user-supplied types and types
+    // taken from BTF. We cannot use BTF in such a case.
+    args.pop_back();
+    args.pop_back();
+    input_files.back() = get_empty_btf_generated_header();
+  }
+
+  if (!handler.parse_file("definitions.h", input, args, input_files))
+  {
+    if (handler.has_redefinition_error())
+    {
+      LOG(WARNING) << "Cannot take type definitions from BTF since there is "
+                      "a redefinition conflict with user-defined types.";
+    }
+    else if (handler.has_unknown_type_error())
+    {
+      LOG(ERROR) << "Include headers with missing type definitions or install "
+                    "BTF information to your system.";
     }
     return false;
   }
@@ -735,6 +817,68 @@ std::optional<std::string> ClangParser::ClangParser::get_unknown_type(
                                      unknown_type_msg.length() - 1);
   }
   return {};
+}
+
+std::unordered_set<std::string> ClangParser::get_unknown_typedefs()
+{
+  // Parse without failing on compilation errors (ie unknown types) because
+  // our goal is to enumerate and analyse all such errors
+  ClangParserHandler handler;
+  if (!handler.parse_file("definitions.h", input, args, input_files, false))
+    return {};
+
+  std::unordered_set<std::string> unknown_typedefs;
+  // Search for error messages of the form:
+  //   unknown type name 'type_t'
+  // that imply an unresolved typedef of type_t. This cannot be done in
+  // clang_visitChildren since clang does not have the unknown type names.
+  for (const auto &msg : handler.get_error_messages())
+  {
+    auto unknown_type = get_unknown_type(msg);
+    if (unknown_type)
+      unknown_typedefs.emplace(unknown_type.value());
+  }
+  return unknown_typedefs;
+}
+
+void ClangParser::resolve_unknown_typedefs_from_btf(BPFtrace &bpftrace)
+{
+  bool check_unknown_types = true;
+  while (check_unknown_types)
+  {
+    // Collect unknown typedefs and retrieve their definitions from BTF.
+    // These must be resolved completely since any unknown typedef will cause
+    // the parser to fail (even if that type is not used in the program).
+    auto incomplete_types = get_unknown_typedefs();
+    size_t types_cnt = bpftrace.btf_set_.size();
+    bpftrace.btf_set_.insert(incomplete_types.cbegin(),
+                             incomplete_types.cend());
+
+    input_files.back() = get_btf_generated_header(bpftrace);
+
+    // No need to continue if no more types were added
+    check_unknown_types = types_cnt != bpftrace.btf_set_.size();
+  }
+}
+
+CXUnsavedFile ClangParser::get_btf_generated_header(BPFtrace &bpftrace)
+{
+  btf_cdef = bpftrace.btf_.c_def(bpftrace.btf_set_);
+  return CXUnsavedFile{
+    .Filename = "/bpftrace/include/__btf_generated_header.h",
+    .Contents = btf_cdef.c_str(),
+    .Length = btf_cdef.size(),
+  };
+}
+
+CXUnsavedFile ClangParser::get_empty_btf_generated_header()
+{
+  btf_cdef = "";
+  return CXUnsavedFile{
+    .Filename = "/bpftrace/include/__btf_generated_header.h",
+    .Contents = btf_cdef.c_str(),
+    .Length = btf_cdef.size(),
+  };
 }
 
 } // namespace bpftrace

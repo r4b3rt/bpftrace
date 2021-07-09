@@ -7,6 +7,8 @@
 #  LIBBCC_DEFINITIONS - Compiler switches required for using libbcc
 #  LIBBCC_BPF_LIBRARY_STATIC - libbpf static library (for static compilation)
 #  LIBBCC_LOADER_LIBRARY_STATIC - libbcc helper static library (for static compilation)
+#  LIBBCC_ATTACH_KPROBE_SIX_ARGS_SIGNATURE
+#  LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE
 #
 # Note that the shared libbcc binary has libbpf and bcc_loader already compiled in but
 # the static doesn't. So when creating a static build those have to be included too.
@@ -19,25 +21,12 @@ find_path (LIBBCC_INCLUDE_DIRS
   NAMES
     bcc/libbpf.h
   PATHS
-    /usr/include
-    /usr/include/bcc
-    /usr/local/include
-    /usr/local/include/libbcc
-    /usr/local/include/bcc
-    /opt/local/include
-    /opt/local/include/libbcc
-    /sw/include
-    /sw/include/libbcc
     ENV CPATH)
 
 find_library (LIBBCC_LIBRARIES
   NAMES
     bcc
   PATHS
-    /usr/lib
-    /usr/local/lib
-    /opt/local/lib
-    /sw/lib
     ENV LIBRARY_PATH
     ENV LD_LIBRARY_PATH)
 
@@ -45,10 +34,6 @@ find_library (LIBBCC_BPF_LIBRARY_STATIC
   NAMES
     bcc_bpf
   PATHS
-    /usr/lib
-    /usr/local/lib
-    /opt/local/lib
-    /sw/lib
     ENV LIBRARY_PATH
     ENV LD_LIBRARY_PATH)
 
@@ -56,10 +41,6 @@ find_library (LIBBCC_LOADER_LIBRARY_STATIC
   NAMES
     bcc-loader-static
   PATHS
-    /usr/lib
-    /usr/local/lib
-    /opt/local/lib
-    /sw/lib
     ENV LIBRARY_PATH
     ENV LD_LIBRARY_PATH)
 
@@ -94,6 +75,15 @@ int main(void) {
   return 0;
 }
 " LIBBCC_ATTACH_KPROBE_SIX_ARGS_SIGNATURE)
+
+CHECK_CXX_SOURCE_COMPILES("
+#include <bcc/libbpf.h>
+
+int main(void) {
+  bpf_attach_uprobe(0, BPF_PROBE_ENTRY, \"\", \"\", 0, 0, 0);
+  return 0;
+}
+" LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE)
 SET(CMAKE_REQUIRED_LIBRARIES)
 SET(CMAKE_REQUIRED_INCLUDES)
 endif()

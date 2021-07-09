@@ -9,16 +9,19 @@
 #include <utility>
 #include <vector>
 
-#include "ast.h"
+#include "ast/ast.h"
 #include "attached_probe.h"
 #include "bpffeature.h"
+#include "bpforc.h"
 #include "btf.h"
 #include "child.h"
 #include "map.h"
 #include "mapmanager.h"
 #include "output.h"
 #include "printf.h"
+#include "probe_matcher.h"
 #include "procmon.h"
+#include "required_resources.h"
 #include "struct.h"
 #include "types.h"
 #include "utils.h"
@@ -33,11 +36,11 @@ struct symbol
   uint64_t address;
 };
 
-class BpfOrc;
 enum class DebugLevel;
 
 // globals
 extern DebugLevel bt_debug;
+extern bool bt_quiet;
 extern bool bt_verbose;
 
 enum class DebugLevel
@@ -81,32 +84,32 @@ private:
   std::string msg_;
 };
 
-struct HelperErrorInfo
-{
-  int func_id;
-  location loc;
-};
-
 class BPFtrace
 {
 public:
   BPFtrace(std::unique_ptr<Output> o = std::make_unique<TextOutput>(std::cout))
-      : out_(std::move(o)),
+      : traceable_funcs_(get_traceable_funcs()),
+        out_(std::move(o)),
         feature_(std::make_unique<BPFfeature>()),
+        probe_matcher_(std::make_unique<ProbeMatcher>(this)),
+        btf_(this),
         ncpus_(get_possible_cpus().size())
   {
   }
   virtual ~BPFtrace();
   virtual int add_probe(ast::Probe &p);
+  Probe generateWatchpointSetupProbe(const std::string &func,
+                                     const ast::AttachPoint &ap,
+                                     const ast::Probe &probe);
   int num_probes() const;
   int run(std::unique_ptr<BpfOrc> bpforc);
+  std::vector<std::unique_ptr<AttachedProbe>> attach_probe(Probe &probe,
+                                                           BpfOrc &bpforc);
+  int run_iter();
   int print_maps();
   int clear_map(IMap &map);
   int zero_map(IMap &map);
   int print_map(IMap &map, uint32_t top, uint32_t div);
-  inline int next_probe_id() {
-    return next_probe_id_++;
-  };
   std::string get_stack(uint64_t stackidpid, bool ustack, StackType stack_type, int indent=0);
   std::string resolve_buf(char *buf, size_t size);
   std::string resolve_ksym(uintptr_t addr, bool show_offset=false);
@@ -118,10 +121,7 @@ public:
   virtual int resolve_uname(const std::string &name,
                             struct symbol *sym,
                             const std::string &path) const;
-  std::string map_value_to_str(const SizedType &stype,
-                               std::vector<uint8_t> value,
-                               bool is_per_cpu,
-                               uint32_t div);
+  std::string resolve_mac_address(const uint8_t *mac_addr) const;
   virtual std::string extract_func_symbols_from_path(const std::string &path) const;
   std::string resolve_probe(uint64_t probe_id) const;
   uint64_t resolve_cgroupid(const std::string &path) const;
@@ -132,28 +132,26 @@ public:
   void request_finalize();
   bool is_aslr_enabled(int pid);
   std::string get_string_literal(const ast::Expression *expr) const;
+  std::optional<std::string> get_watchpoint_binary_path() const;
+  virtual bool is_traceable_func(const std::string &func_name) const;
 
+  std::vector<std::unique_ptr<AttachedProbe>> attached_probes_;
+  std::vector<Probe> watchpoint_probes_;
   std::string cmd_;
   bool finalize_ = false;
   // Global variable checking if an exit signal was received
   static volatile sig_atomic_t exitsig_recv;
 
+  RequiredResources resources;
   MapManager maps;
-  std::map<std::string, Struct> structs_;
+  std::unique_ptr<BpfOrc> bpforc_;
+  StructManager structs;
   std::map<std::string, std::string> macros_;
   std::map<std::string, uint64_t> enums_;
-  std::vector<std::tuple<std::string, std::vector<Field>>> printf_args_;
-  std::vector<std::tuple<std::string, std::vector<Field>>> system_args_;
-  std::vector<std::string> join_args_;
-  std::vector<std::string> time_args_;
-  std::vector<std::string> strftime_args_;
-  std::vector<std::tuple<std::string, std::vector<Field>>> cat_args_;
-  std::vector<SizedType> non_map_print_args_;
-  std::unordered_map<int64_t, struct HelperErrorInfo> helper_error_info_;
+  std::unordered_set<std::string> traceable_funcs_;
 
-  std::vector<std::string> probe_ids_;
-  unsigned int join_argnum_;
-  unsigned int join_argsize_;
+  unsigned int join_argnum_ = 16;
+  unsigned int join_argsize_ = 1024;
   std::unique_ptr<Output> out_;
   std::unique_ptr<BPFfeature> feature_;
 
@@ -163,29 +161,23 @@ public:
   uint64_t max_probes_ = 512;
   uint64_t log_size_ = 1000000;
   uint64_t perf_rb_pages_ = 64;
+  uint64_t max_type_res_iterations = 0;
   bool demangle_cpp_symbols_ = true;
   bool resolve_user_symbols_ = true;
   bool cache_user_symbols_ = true;
   bool safe_mode_ = true;
-  bool force_btf_ = false;
   bool has_usdt_ = false;
   bool usdt_file_activation_ = false;
   int helper_check_level_ = 0;
+  uint64_t ast_max_nodes_ = 0; // Maximum AST nodes allowed for fuzzing
   std::optional<struct timespec> boottime_;
 
   static void sort_by_key(
       std::vector<SizedType> key_args,
       std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
           &values_by_key);
-  std::set<std::string> find_wildcard_matches(
-      const ast::AttachPoint &attach_point) const;
-  std::set<std::string> find_symbol_matches(
-      const ast::AttachPoint &attach_point) const;
-  virtual std::unique_ptr<std::istream> get_symbols_from_file(
-      const std::string &path) const;
-  virtual std::unique_ptr<std::istream> get_symbols_from_usdt(
-      int pid,
-      const std::string &target) const;
+
+  std::unique_ptr<ProbeMatcher> probe_matcher_;
 
   BTF btf_;
   std::unordered_set<std::string> btf_set_;
@@ -196,22 +188,18 @@ public:
   {
     return procmon_ ? procmon_->pid() : 0;
   }
-
-protected:
-  std::vector<Probe> probes_;
-  std::vector<Probe> special_probes_;
-
-private:
-  int run_special_probe(std::string name,
-                        const BpfOrc &bpforc,
-                        void (*trigger)(void));
-  std::vector<std::unique_ptr<AttachedProbe>> attached_probes_;
-  void* ksyms_{nullptr};
-  std::map<std::string, std::pair<int, void *>> exe_sym_; // exe -> (pid, cache)
   int ncpus_;
   int online_cpus_;
+
+  std::vector<Probe> probes_;
+  std::vector<Probe> special_probes_;
+private:
+  int run_special_probe(std::string name,
+                        BpfOrc &bpforc,
+                        void (*trigger)(void));
+  void* ksyms_{nullptr};
+  std::map<std::string, std::pair<int, void *>> exe_sym_; // exe -> (pid, cache)
   std::vector<std::string> params_;
-  int next_probe_id_ = 0;
 
   std::vector<std::unique_ptr<void, void (*)(void *)>> open_perf_buffers_;
 
@@ -220,19 +208,13 @@ private:
       std::tuple<uint8_t *, uintptr_t> func,
       int pid,
       bool file_activation);
-  std::vector<std::unique_ptr<AttachedProbe>> attach_probe(
-      Probe &probe,
-      const BpfOrc &bpforc);
   int setup_perf_events();
   void poll_perf_events(int epollfd, bool drain = false);
   int print_map_hist(IMap &map, uint32_t top, uint32_t div);
   int print_map_stats(IMap &map, uint32_t top, uint32_t div);
-  template <typename T>
-  static T reduce_value(const std::vector<uint8_t> &value, int nvalues);
-  static int64_t min_value(const std::vector<uint8_t> &value, int nvalues);
-  static uint64_t max_value(const std::vector<uint8_t> &value, int nvalues);
   static uint64_t read_address_from_output(std::string output);
   std::vector<uint8_t> find_empty_key(IMap &map, size_t size) const;
+  bool has_iter_ = false;
 };
 
 } // namespace bpftrace
