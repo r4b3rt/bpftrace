@@ -2,7 +2,7 @@
 
 # Report missing kernel features
 #
-# Usage: ./check_kernel_features.sh
+# Usage: ./check_kernel_features.sh [PATH_TO_KERNEL_CONFIG]
 
 set -e
 set -u
@@ -11,15 +11,15 @@ err=0
 config=''
 
 # Find kernel config
-for c in "/boot/config-$(uname -r)" "/boot/config" "/proc/config.gz"; do
-    if [ -f "$c" ]; then
+for c in "$@" "/boot/config-$(uname -r)" "/boot/config" "/proc/config.gz"; do
+    if [ -r "$c" ]; then
         config="$c"
         break
     fi
 done
 
 if [ -z "$config" ]; then
-    echo "Could not find kernel config" >&2
+    echo "Could not find kernel config, please supply it as argument." >&2
     exit 1
 fi
 
@@ -37,6 +37,16 @@ check_opt 'CONFIG_BPF_JIT'
 check_opt 'CONFIG_BPF_SYSCALL'
 check_opt 'CONFIG_FTRACE_SYSCALLS'
 check_opt 'CONFIG_HAVE_EBPF_JIT'
+check_opt 'CONFIG_FUNCTION_TRACER'
+check_opt 'CONFIG_HAVE_DYNAMIC_FTRACE'
+check_opt 'CONFIG_DYNAMIC_FTRACE'
+check_opt 'CONFIG_HAVE_KPROBES'
+check_opt 'CONFIG_KPROBES'
+check_opt 'CONFIG_KPROBE_EVENTS'
+check_opt 'CONFIG_ARCH_SUPPORTS_UPROBES'
+check_opt 'CONFIG_UPROBES'
+check_opt 'CONFIG_UPROBE_EVENTS'
+check_opt 'CONFIG_DEBUG_FS'
 
 # Status report
 if [ $err -eq 0 ]; then
